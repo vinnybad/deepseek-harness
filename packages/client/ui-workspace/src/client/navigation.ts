@@ -9,6 +9,7 @@ import type {
   SessionReference,
   SessionTarget,
   SessionListState,
+  SessionSummary,
 } from '@deepseek-ai/dsh-api-session-controller/client'
 // Type-only: pulls the `agentPreset` Session projection value into this program.
 import type {} from '@deepseek-ai/dsh-agent-preset-registry/types'
@@ -22,11 +23,24 @@ import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
 import type { DraftInitializationOptions } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { RowToast } from './contract/slots.ts'
 import { pinOrderAccounts, pinOrderSource } from './pin-order.ts'
+import { browserSessionUrl, linkedSessionId, sessionUrl, type SessionUrlEnvironment } from './session-url.ts'
 import type { WorkspaceViewStoreActions } from './stores.ts'
+
+/** One Session URL write: a user navigation, a silent correction, or none. */
+type UrlWrite = 'push' | 'replace' | 'none'
 
 interface MainSelection {
   readonly sessionId?: SessionId
   readonly subagentAddress?: SubagentAddress
+}
+
+/** A listed Session summary, excluding inherited object keys a URL or stored value could name. */
+function listedSession(
+  sessions: SessionListState,
+  sessionId: SessionId | undefined,
+): SessionSummary | undefined {
+  if (sessionId === undefined || !Object.hasOwn(sessions.byId, sessionId)) return undefined
+  return sessions.byId[sessionId]
 }
 
 /** Content preparation and Agent preset for the Session a Workspace flow opens. */
@@ -168,6 +182,7 @@ class UiWorkspaceService extends Service implements UiWorkspace {
    * @param sessions - pure Session Controller.
    * @param view - the browser's viewing-store write set (one instance shared with its registration).
    * @param notify - show one notice through the Workspace notice channel.
+   * @param page - browser URL and history surface; absent outside a browser.
    */
   constructor(
     ctx: Context,
@@ -176,12 +191,16 @@ class UiWorkspaceService extends Service implements UiWorkspace {
     private readonly sessions: ISessions,
     private readonly view: Pick<WorkspaceViewStoreActions, 'pinSessionOrder'>,
     private readonly notify: (toast: RowToast) => void,
+    private readonly page: SessionUrlEnvironment | undefined = browserSessionUrl(),
   ) {
     super(ctx, 'uiWorkspace')
     ctx.effect(() => {
-      const stop = this.watchNavigation()
+      const stopNavigation = this.watchNavigation()
+      const page = this.page
+      const stopHistory = page?.listen(() => { this.followUrl(page) })
       return () => {
-        stop()
+        stopNavigation()
+        stopHistory?.()
         this.lifetime.abort()
         const reference = this.mainReference
         this.mainReference = undefined
@@ -405,6 +424,29 @@ class UiWorkspaceService extends Service implements UiWorkspace {
     return result.value
   }
 
+  /** Follow a browser Back or Forward traversal to the Session its URL names. */
+  private followUrl(page: SessionUrlEnvironment): void {
+    if (this.lifetime.signal.aborted) return
+    const linked = linkedSessionId(page.currentHref())
+    if (linked === undefined) {
+      this.clearMain()
+      return
+    }
+    const archived = this.workspaces.list.getSnapshot().archivedSessionIds.includes(linked)
+    if (listedSession(this.sessions.list.getSnapshot(), linked) === undefined || archived) {
+      console.warn(archived
+        ? `Session URL names an archived Session: ${linked}`
+        : `Session URL names an unknown Session: ${linked}`)
+      this.writeUrl(this.mainReference?.sessionId, 'replace')
+      return
+    }
+    try {
+      this.replaceMain(linked, this.lifetime.signal, 'preserve', undefined, 'none')
+    } catch (error: unknown) {
+      console.warn('Session URL navigation failed:', error)
+    }
+  }
+
   private watchNavigation(): () => void {
     let initial: 'waiting' | 'connecting' | 'done' = 'waiting'
     const reconcile = (): void => {
@@ -440,16 +482,21 @@ class UiWorkspaceService extends Service implements UiWorkspace {
   }
 
   private async restoreSelection(workspaces: WorkspaceSnapshot, sessions: SessionListState): Promise<void> {
-    const saved = this.selection.getSnapshot()
+    const linked = this.page === undefined ? undefined : linkedSessionId(this.page.currentHref())
+    const linkedListed = linked !== undefined && listedSession(sessions, linked) !== undefined
+    const linkedArchived = linked !== undefined && workspaces.archivedSessionIds.includes(linked)
+    const saved = linkedListed && !linkedArchived
+      ? { sessionId: linked, ...this.savedSubagentAddress(linked) }
+      : this.selection.getSnapshot()
     if (saved.subagentAddress !== undefined) {
-      this.replaceMain(saved.subagentAddress, this.lifetime.signal, 'preserve')
+      this.replaceMain(saved.subagentAddress, this.lifetime.signal, 'preserve', undefined, 'replace')
       return
     }
-    const summary = saved.sessionId === undefined ? undefined : sessions.byId[saved.sessionId]
+    const summary = listedSession(sessions, saved.sessionId)
     const workspace = summary === undefined ? undefined
       : workspaces.items.find(item => item.sessionIds.includes(summary.id))
     if (summary !== undefined && (!summary.blank || workspace === undefined)) {
-      this.replaceMain(summary.id, this.lifetime.signal, 'preserve')
+      this.replaceMain(summary.id, this.lifetime.signal, 'preserve', undefined, 'replace')
       return
     }
     const navigation = AbortSignal.any([this.ctx.layout.beginNavigation(), this.lifetime.signal])
@@ -466,8 +513,14 @@ class UiWorkspaceService extends Service implements UiWorkspace {
     }
     if (sessionId === undefined && target !== undefined) sessionId = await this.connectWorkspace(target)
     if (sessionId !== undefined && !navigation.aborted) {
-      this.replaceMain(sessionId, navigation, 'preserve')
+      this.replaceMain(sessionId, navigation, 'preserve', undefined, 'replace')
     }
+  }
+
+  /** The durable subagent address a linked Session resolves to, when it is a child. */
+  private savedSubagentAddress(sessionId: SessionId): Pick<MainSelection, 'subagentAddress'> {
+    const subagentAddress = this.sessions.subagentAddress(sessionId)
+    return subagentAddress === undefined ? {} : { subagentAddress }
   }
 
   private async initializeDefaultWorkspace(signal: AbortSignal): Promise<WorkspaceView | undefined> {
@@ -488,10 +541,11 @@ class UiWorkspaceService extends Service implements UiWorkspace {
     return true
   }
 
-  private clearMain(): void {
+  private clearMain(url: UrlWrite = 'replace'): void {
     const previous = this.mainReference
     this.mainReference = undefined
     this.selection.set({})
+    this.writeUrl(undefined, url)
     previous?.release()
     this.ctx.layout.selectPanel(null)
   }
@@ -501,6 +555,7 @@ class UiWorkspaceService extends Service implements UiWorkspace {
     signal: AbortSignal,
     panel: 'reveal' | 'preserve',
     beforeOpen?: (sessionId: SessionId) => void,
+    url: UrlWrite = 'push',
   ): void {
     signal.throwIfAborted()
     const reference = this.sessions.retain(target, { source: 'mainView' })
@@ -524,8 +579,24 @@ class UiWorkspaceService extends Service implements UiWorkspace {
     }
     const previous = this.mainReference
     this.mainReference = reference
+    this.writeUrl(reference.sessionId, url)
     previous?.release()
     if (panel === 'reveal') this.ctx.layout.selectPanel(null)
+  }
+
+  /** Keep the page URL naming the displayed Session; canonical history writes never fail navigation. */
+  private writeUrl(sessionId: SessionId | undefined, mode: UrlWrite): void {
+    const page = this.page
+    if (page === undefined || mode === 'none') return
+    try {
+      const href = page.currentHref()
+      if (linkedSessionId(href) === sessionId) return
+      const next = sessionUrl(href, sessionId)
+      if (mode === 'push') page.push(next)
+      else page.replace(next)
+    } catch (error: unknown) {
+      console.warn('Session URL update failed:', error)
+    }
   }
 
 }

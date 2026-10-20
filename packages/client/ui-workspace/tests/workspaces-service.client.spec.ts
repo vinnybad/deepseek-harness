@@ -20,6 +20,7 @@ import { LocaleRuntime } from '@deepseek-ai/dsh-client-locale/client'
 import type { DraftInitializationOptions, SessionInputResolver } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { RowToast } from '../src/client/contract/slots.ts'
 import { DirectoryBrowseError, UiWorkspaceService } from '../src/client/navigation.ts'
+import type { SessionUrlEnvironment } from '../src/client/session-url.ts'
 import { en, zh } from '../src/client/locales.ts'
 import { createWorkspaceViewStore, FLAT_SESSION_ORDER_KEY } from '../src/client/stores.ts'
 import { UNGROUPED_KEY } from '../src/client/tree.ts'
@@ -276,6 +277,44 @@ interface BenchOptions {
   readonly workspaces?: WorkspaceSnapshot
   readonly sessions?: SessionListState
   readonly configureSessions?: (sessions: FakeSessions) => void
+  readonly page?: SessionUrlEnvironment
+}
+
+/** In-memory browser URL and history, shared by the deep-link cases. */
+class FakeSessionUrl implements SessionUrlEnvironment {
+  readonly pushes: string[] = []
+  readonly replaces: string[] = []
+  readonly listeners = new Set<() => void>()
+  href: string
+
+  constructor(href: string) {
+    this.href = href
+  }
+
+  currentHref(): string {
+    return this.href
+  }
+
+  push(url: string): void {
+    this.pushes.push(url)
+    this.href = new URL(url, this.href).href
+  }
+
+  replace(url: string): void {
+    this.replaces.push(url)
+    this.href = new URL(url, this.href).href
+  }
+
+  listen(listener: () => void): () => void {
+    this.listeners.add(listener)
+    return () => { this.listeners.delete(listener) }
+  }
+
+  /** Simulate one browser Back/Forward traversal to an absolute URL. */
+  go(href: string): void {
+    this.href = href
+    for (const listener of [...this.listeners]) listener()
+  }
 }
 
 function bench(options: BenchOptions = {}) {
@@ -309,6 +348,7 @@ function bench(options: BenchOptions = {}) {
     sessions,
     view.actions,
     notify,
+    options.page,
   )
   return { ctx, directoryPicker, sessions, uiWorkspace, workspaces, layout, selectPanel, view, notify, requestDraftInitialization }
 }
@@ -1508,6 +1548,223 @@ describe('UiWorkspaceService', () => {
     })
     await expect(b.uiWorkspace.createDirectory('/home/u', 'new')).rejects.toMatchObject({
       rpcError: { code: 'directory-picker/exists' },
+    })
+  })
+
+  describe('Session URL deep links', () => {
+    it('opens the Session named by the page URL instead of the saved selection', () => {
+      persistSelection({ sessionId: sid('saved') })
+      const page = new FakeSessionUrl('http://dsh.test/tools/dsh/?session=linked')
+      const b = bench({
+        sessions: sessionState([summary('saved'), summary('linked')]),
+        workspaces: workspaceState(),
+        page,
+      })
+
+      expect(b.sessions.retain).toHaveBeenCalledExactlyOnceWith(sid('linked'), { source: 'mainView' })
+      expect(page.pushes).toEqual([])
+      expect(page.replaces).toEqual([])
+    })
+
+    it('restores the saved Session and canonicalizes the page URL when the URL names none', () => {
+      persistSelection({ sessionId: sid('saved') })
+      const page = new FakeSessionUrl('http://dsh.test/tools/dsh/?view=flat')
+      bench({
+        sessions: sessionState([summary('saved')]),
+        workspaces: workspaceState(),
+        page,
+      })
+
+      expect(page.pushes).toEqual([])
+      expect(page.replaces).toEqual(['/tools/dsh/?view=flat&session=saved'])
+    })
+
+    it('falls back to the saved Session when the URL names an unknown one', () => {
+      persistSelection({ sessionId: sid('saved') })
+      const page = new FakeSessionUrl('http://dsh.test/?session=missing')
+      const b = bench({
+        sessions: sessionState([summary('saved')]),
+        workspaces: workspaceState(),
+        page,
+      })
+
+      expect(b.sessions.retain).toHaveBeenCalledExactlyOnceWith(sid('saved'), { source: 'mainView' })
+      expect(page.replaces).toEqual(['/?session=saved'])
+    })
+
+    it('adds one history entry per opened Session and follows Back without another', () => {
+      const page = new FakeSessionUrl('http://dsh.test/')
+      const b = bench({
+        sessions: sessionState([summary('a'), summary('b')]),
+        workspaces: workspaceState(),
+        page,
+      })
+
+      b.uiWorkspace.openSession(sid('a'))
+      b.uiWorkspace.openSession(sid('b'))
+      b.uiWorkspace.openSession(sid('b'))
+      expect(page.pushes).toEqual(['/?session=a', '/?session=b'])
+
+      page.go('http://dsh.test/?session=a')
+      expect(b.sessions.retained.at(-1)!.reference.sessionId).toBe(sid('a'))
+      expect(page.pushes).toEqual(['/?session=a', '/?session=b'])
+    })
+
+    it('clears the selection when history returns to a URL without a Session', () => {
+      const page = new FakeSessionUrl('http://dsh.test/')
+      const b = bench({
+        sessions: sessionState([summary('current')]),
+        workspaces: workspaceState(),
+        page,
+      })
+
+      b.uiWorkspace.openSession(sid('current'))
+      page.go('http://dsh.test/')
+
+      expect(b.sessions.retained[0]!.release).toHaveBeenCalledOnce()
+      expect(b.sessions.retained).toHaveLength(1)
+    })
+
+    it('keeps the current Session when history returns to an unknown Session', () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const page = new FakeSessionUrl('http://dsh.test/')
+      const b = bench({
+        sessions: sessionState([summary('current')]),
+        workspaces: workspaceState(),
+        page,
+      })
+
+      b.uiWorkspace.openSession(sid('current'))
+      page.go('http://dsh.test/?session=missing')
+
+      expect(warn).toHaveBeenCalledExactlyOnceWith('Session URL names an unknown Session: missing')
+      expect(page.replaces.at(-1)).toBe('/?session=current')
+      expect(b.sessions.retained.at(-1)!.reference.sessionId).toBe(sid('current'))
+    })
+
+    it('keeps the current Session when history returns to an archived Session', () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const page = new FakeSessionUrl('http://dsh.test/')
+      const b = bench({
+        sessions: sessionState([summary('current'), summary('archived')]),
+        workspaces: workspaceState([], [sid('archived')]),
+        page,
+      })
+
+      b.uiWorkspace.openSession(sid('current'))
+      page.go('http://dsh.test/?session=archived')
+
+      expect(warn).toHaveBeenCalledExactlyOnceWith('Session URL names an archived Session: archived')
+      expect(page.replaces.at(-1)).toBe('/?session=current')
+      expect(b.sessions.retained.at(-1)!.reference.sessionId).toBe(sid('current'))
+    })
+
+    it('removes the Session from the URL when the selection is cleared', async () => {
+      const page = new FakeSessionUrl('http://dsh.test/')
+      const b = bench({
+        sessions: sessionState([summary('current')]),
+        workspaces: workspaceState(),
+        page,
+      })
+
+      b.uiWorkspace.openSession(sid('current'))
+      await b.uiWorkspace.archiveSession(sid('current'))
+
+      expect(page.replaces.at(-1)).toBe('/')
+      expect(b.sessions.retained[0]!.release).toHaveBeenCalledOnce()
+    })
+
+    it('falls back to the saved Session when the URL names an archived one', () => {
+      persistSelection({ sessionId: sid('saved') })
+      const page = new FakeSessionUrl('http://dsh.test/?session=archived')
+      const b = bench({
+        sessions: sessionState([summary('saved'), summary('archived')]),
+        workspaces: workspaceState([], [sid('archived')]),
+        page,
+      })
+
+      expect(b.sessions.retain).toHaveBeenCalledExactlyOnceWith(sid('saved'), { source: 'mainView' })
+      expect(page.replaces).toEqual(['/?session=saved'])
+    })
+
+    it('ignores a URL that names an inherited object key', () => {
+      persistSelection({ sessionId: sid('saved') })
+      const page = new FakeSessionUrl('http://dsh.test/?session=__proto__')
+      const b = bench({
+        sessions: sessionState([summary('saved')]),
+        workspaces: workspaceState(),
+        page,
+      })
+
+      expect(b.sessions.retain).toHaveBeenCalledExactlyOnceWith(sid('saved'), { source: 'mainView' })
+      expect(page.replaces).toEqual(['/?session=saved'])
+    })
+
+    it('opens a subagent address named by the page URL', () => {
+      const address: SubagentAddress = {
+        parentSessionId: sid('parent'),
+        childSessionId: sid('child'),
+        mode: 'continuable',
+      }
+      const page = new FakeSessionUrl('http://dsh.test/?session=child')
+      const b = bench({
+        sessions: sessionState([summary('child')]),
+        workspaces: workspaceState(),
+        page,
+        configureSessions: (sessions) => { sessions.subagentAddress.mockReturnValue(address) },
+      })
+
+      expect(b.sessions.retain).toHaveBeenCalledExactlyOnceWith(address, { source: 'mainView' })
+    })
+
+    it('reports a failed history navigation without changing the current Session', () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const page = new FakeSessionUrl('http://dsh.test/')
+      const b = bench({
+        sessions: sessionState([summary('a'), summary('b')]),
+        workspaces: workspaceState(),
+        page,
+      })
+
+      b.uiWorkspace.openSession(sid('a'))
+      b.sessions.retain.mockImplementationOnce(() => { throw new Error('retain failed') })
+      page.go('http://dsh.test/?session=b')
+
+      expect(warn).toHaveBeenCalledWith('Session URL navigation failed:', expect.any(Error))
+      expect(b.sessions.retained.at(-1)!.reference.sessionId).toBe(sid('a'))
+    })
+
+    it('ignores a retained history listener after disposal', async () => {
+      const page = new FakeSessionUrl('http://dsh.test/')
+      const b = bench({ page })
+      const listener = [...page.listeners][0]!
+
+      await b.ctx.fiber.dispose()
+      listener()
+
+      expect(b.sessions.retain).not.toHaveBeenCalled()
+    })
+
+    it('keeps navigation when the browser refuses a history write', () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const page = new FakeSessionUrl('http://dsh.test/')
+      vi.spyOn(page, 'push').mockImplementation(() => { throw new Error('blocked') })
+      const b = bench({ page })
+
+      b.uiWorkspace.openSession(sid('a'))
+
+      expect(b.sessions.retain).toHaveBeenCalledWith(sid('a'), { source: 'mainView' })
+      expect(warn).toHaveBeenCalledWith('Session URL update failed:', expect.any(Error))
+    })
+
+    it('removes its history listener when the service is disposed', async () => {
+      const page = new FakeSessionUrl('http://dsh.test/')
+      const b = bench({ page })
+      expect(page.listeners.size).toBe(1)
+
+      await b.ctx.fiber.dispose()
+
+      expect(page.listeners.size).toBe(0)
     })
   })
 })
