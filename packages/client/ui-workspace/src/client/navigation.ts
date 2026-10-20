@@ -444,6 +444,7 @@ class UiWorkspaceService extends Service implements UiWorkspace {
       this.replaceMain(linked, this.lifetime.signal, 'preserve', undefined, 'none')
     } catch (error: unknown) {
       console.warn('Session URL navigation failed:', error)
+      this.writeUrl(this.mainReference?.sessionId, 'replace')
     }
   }
 

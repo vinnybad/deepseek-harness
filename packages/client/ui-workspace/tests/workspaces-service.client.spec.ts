@@ -1731,6 +1731,7 @@ describe('UiWorkspaceService', () => {
       page.go('http://dsh.test/?session=b')
 
       expect(warn).toHaveBeenCalledWith('Session URL navigation failed:', expect.any(Error))
+      expect(page.replaces.at(-1)).toBe('/?session=a')
       expect(b.sessions.retained.at(-1)!.reference.sessionId).toBe(sid('a'))
     })
 
