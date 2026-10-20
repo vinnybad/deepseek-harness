@@ -1610,6 +1610,25 @@ describe('UiWorkspaceService', () => {
       expect(page.pushes).toEqual(['/?session=a', '/?session=b'])
     })
 
+    it('cancels a pending Workspace navigation when history selects a Session', async () => {
+      const created = Promise.withResolvers<SessionId>()
+      const page = new FakeSessionUrl('http://dsh.test/?session=a')
+      const b = bench({
+        sessions: sessionState([summary('a')]),
+        workspaces: workspaceState([workspace('a')]),
+        page,
+        configureSessions: (sessions) => { sessions.create.mockReturnValue(created.promise) },
+      })
+
+      const opening = b.uiWorkspace.openWorkspace(wid('a'))
+      page.go('http://dsh.test/?session=a')
+      created.resolve(sid('created-a'))
+      await opening
+
+      expect(b.sessions.retain.mock.calls.map(([target]) => target)).toEqual([sid('a'), sid('a')])
+      expect(b.sessions.retained.at(-1)!.reference.sessionId).toBe(sid('a'))
+    })
+
     it('clears the selection when history returns to a URL without a Session', () => {
       const page = new FakeSessionUrl('http://dsh.test/')
       const b = bench({
